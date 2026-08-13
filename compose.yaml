@@ -1,0 +1,209 @@
+name: ${COMPOSE_PROJECT_NAME:-starter-app-devops}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-psu_activities}
+      POSTGRES_USER: ${PGUSER:-app_user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ:-Asia/Bangkok}
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # PostgreSQL เรียกไฟล์นี้เฉพาะตอนสร้าง data volume ใหม่เท่านั้น
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+
+  backend:
+    image: ${BACKEND_IMAGE:-starter-app-devops-backend}:${IMAGE_TAG:-local}
+    build:
+      context: ./backend
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      PORT: 3001
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-psu_activities}
+      PGUSER: ${PGUSER:-app_user}
+      PGPOOL_MAX: ${PGPOOL_MAX:-10}
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app
+      - data
+    logging: *default-logging
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-starter-app-devops-frontend}:${IMAGE_TAG:-local}
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_HTTP_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - edge
+      - app
+    logging: *default-logging
+
+  backup:
+    profiles: ["backup"]
+    image: ${BACKUP_IMAGE:-starter-app-devops-backup}:${IMAGE_TAG:-local}
+    build:
+      context: ./backup
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-psu_activities}
+      PGUSER: ${PGUSER:-app_user}
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_ENCRYPTION_PASSPHRASE_FILE: /run/secrets/backup_encryption_passphrase
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      TZ: ${TZ:-Asia/Bangkok}
+    secrets:
+      - postgres_password
+      - backup_encryption_passphrase
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+      - ./monitoring/textfile:/metrics
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - data
+    logging: *default-logging
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - alertmanager
+      - blackbox-exporter
+      - cadvisor
+      - node-exporter
+    networks:
+      - edge
+      - monitoring
+    logging: *default-logging
+
+  alertmanager:
+    profiles: ["monitoring"]
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    networks:
+      - edge
+      - monitoring
+    logging: *default-logging
+
+  blackbox-exporter:
+    profiles: ["monitoring"]
+    image: prom/blackbox-exporter:v0.27.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/blackbox_exporter/config.yml
+    volumes:
+      - ./monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    networks:
+      - app
+      - monitoring
+    logging: *default-logging
+
+  cadvisor:
+    profiles: ["monitoring"]
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks:
+      - monitoring
+    logging: *default-logging
+
+  node-exporter:
+    profiles: ["monitoring"]
+    image: quay.io/prometheus/node-exporter:v1.9.1
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile
+    volumes:
+      - /:/host:ro
+      - ./monitoring/textfile:/var/lib/node_exporter/textfile:ro
+    networks:
+      - monitoring
+    logging: *default-logging
+
+networks:
+  edge:
+  app:
+    internal: true
+  data:
+    internal: true
+  monitoring:
+    internal: true
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  alertmanager_data:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:-./secrets/postgres_password.txt}
+  backup_encryption_passphrase:
+    file: ${BACKUP_ENCRYPTION_PASSPHRASE_FILE:-./secrets/backup_encryption_passphrase.txt}

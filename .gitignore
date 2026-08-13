@@ -1,7 +1,19 @@
 node_modules/
+.npm-cache/
 .env
 .env.local
 *.log
 npm-debug.log*
 coverage/
 .DS_Store
+.deploy/
+
+# Runtime secrets must never be committed.
+secrets/*
+!secrets/README.md
+
+# Backup archives and generated Prometheus textfile metrics.
+backups/*
+!backups/.gitkeep
+monitoring/textfile/*
+!monitoring/textfile/.gitkeep
